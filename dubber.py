@@ -1,7 +1,6 @@
-filepath = ""
 input_filepath="static/uploads/"
 output_filepath = "~/Transcripts/"
-bucketname = "dubbing-speech-to-text-bucket"
+bucketname = "dubbing-speech-to-text-bucket1"
 from googletrans import Translator
 from pydub import AudioSegment
 import io
@@ -10,15 +9,12 @@ from google.cloud import speech
 import wave
 from google.cloud import storage
 import google.cloud.texttospeech as tts
-from pytube import YouTube
 import moviepy.editor as mp
 from ssml_builder.core import Speech
 
-def video_download_from_link(filename,url: str=None, outpath: str = "./"):
+def extract_audio(filename):
 
-    #yt = YouTube(url)
-
-    # yt.streams.filter(file_extension="mp4").get_by_resolution("360p").download(outpath,filename='motiv.mp4')
+    """Extracting the audio from video using moviepy"""
 
     my_clip = mp.VideoFileClip(input_filepath + filename)
     my_clip
@@ -27,12 +23,16 @@ def video_download_from_link(filename,url: str=None, outpath: str = "./"):
 
 
 def stereo_to_mono(audio_file_name):
+    """Converting the audio stream to mono if its stereo"""
+
     sound = AudioSegment.from_wav(audio_file_name)
     sound = sound.set_channels(1)
     sound.export(audio_file_name, format="wav")
 
 
 def frame_rate_channel(audio_file_name):
+    """fetching the framerate of the extracted audio clip"""
+
     with wave.open(audio_file_name, "rb") as wave_file:
         frame_rate = wave_file.getframerate()
         channels = wave_file.getnchannels()
@@ -41,7 +41,7 @@ def frame_rate_channel(audio_file_name):
 
 
 def upload_blob(bucket_name, source_file_name, destination_blob_name):
-    """Uploads a file to the bucket."""
+    """Uploads a file to the Google Cloud bucket."""
     storage_client = storage.Client()
     bucket = storage_client.get_bucket(bucket_name)
     blob = bucket.blob(destination_blob_name)
@@ -49,7 +49,7 @@ def upload_blob(bucket_name, source_file_name, destination_blob_name):
     blob.upload_from_filename(source_file_name)
 
 def delete_blob(bucket_name, blob_name):
-    """Deletes a blob from the bucket."""
+    """Deletes a blob from the Google Cloud bucket."""
     storage_client = storage.Client()
     bucket = storage_client.get_bucket(bucket_name)
     blob = bucket.blob(blob_name)
@@ -58,14 +58,21 @@ def delete_blob(bucket_name, blob_name):
 
 
 def audio_to_text(audio_file_name,original_language,target_language):
-    file_name = filepath + audio_file_name
+    """Converting the audio to text by Google's Speech to Text Api"""
+
+    file_name = audio_file_name
     frame_rate, channels = frame_rate_channel(file_name)
+
+    """Checking if the audio stream is stereo or mono. If its stereo it will be converted to mono"""
+
     if channels > 1:
         stereo_to_mono(file_name)
 
     bucket_name = bucketname
-    source_file_name = filepath + audio_file_name
+    source_file_name = audio_file_name
     destination_blob_name = audio_file_name
+
+    """Passing the required parameters to Upload Blob Function to upload audio file to Google cloud bucket """
 
     upload_blob(bucket_name, source_file_name, destination_blob_name)
 
@@ -75,6 +82,8 @@ def audio_to_text(audio_file_name,original_language,target_language):
     client = speech.SpeechClient()
     audio = speech.RecognitionAudio(uri=gcs_uri)
 
+    """Setting the parameters for the speech tp text API """
+
     config = speech.RecognitionConfig(
         encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
         sample_rate_hertz=frame_rate,
@@ -82,69 +91,88 @@ def audio_to_text(audio_file_name,original_language,target_language):
         enable_word_time_offsets=True,
     )
 
+    """Passing the audio and configuration to the API"""
+
     operation = client.long_running_recognize(config=config, audio=audio)
     response = operation.result(timeout=10000)
 
-    for result in response.results:
-        transcript += result.alternatives[0].transcript
+    """Deleting the audio file from google cloud bucket"""
 
     delete_blob(bucket_name, destination_blob_name)
     stamp = 0.0
+
+    """Using ssml for text to speech"""
+
     sp = Speech()
+
+    """Grouping the response text in sentences and passing them to the text translation API"""
+
     sentence = ''
-    for result in response.results:
-        alternative = result.alternatives[0]
-        for word_info in alternative.words:
-            word = word_info.word
-            start_time = word_info.start_time
-            end_time = word_info.end_time
-            if stamp == 0.0 :
-                sp.pause(time=end_time.total_seconds())
-                stamp = end_time.total_seconds()
-                sentence += word
-            elif stamp == start_time.total_seconds():
-                sentence+=' '+word
-                stamp = end_time.total_seconds()
-            elif stamp != start_time.total_seconds():
-                sentence=text_translation(sentence,original_language,target_language)
-                sp.add_text(sentence)
-                sp.pause(time=start_time.total_seconds() - stamp)
-                sentence=''
-                sentence+=word
-                stamp = end_time.total_seconds()
+    alternative = response.results[0].alternatives[0]
+    for word_info in alternative.words:
+        word = word_info.word
+        start_time = word_info.start_time
+        end_time = word_info.end_time
+        if stamp == 0.0:
+
+            """Adding Pauses in dubbed audio according to the source video """
+
+            sp.pause(time=end_time.total_seconds())
+            stamp = end_time.total_seconds()
+            sentence += word
+        elif stamp == start_time.total_seconds():
+            sentence += ' ' + word
+            stamp = end_time.total_seconds()
+        elif stamp != start_time.total_seconds():
+            """Translating a single sentence"""
+            sentence = text_translation(sentence, original_language, target_language)
+            """Adding the sentence to ssml"""
+            sp.add_text(sentence)
+            """Adding Pauses in dubbed audio according to the source video """
+            sp.pause(time=start_time.total_seconds() - stamp)
+            sentence = ''
+            sentence += word
+            stamp = end_time.total_seconds()
     sentence = text_translation(sentence,original_language,target_language)
     sp.add_text(sentence)
+    """Storing the finalized ssml in a variable """
     ssml = sp.speak()
     return ssml
 
 
 def text_translation(content,original_language,target_language):
+
+    """Extracting the language code from the variables"""
+
     original_language=original_language.split('-',1)
     target_language=target_language.split('-',1)
     print(original_language)
     print(target_language)
+    """Translating the text content"""
     file_translate = Translator()
     result = file_translate.translate(content, dest=target_language[0], src=original_language[0])
-
     print(result.text)
-
     res = result.text
-    a = open("urdu.txt", "w+", encoding='utf-8')
-    a.write(res)
+
     return res
 
-def text_to_audio(voice_name: str, text: str,video_file):
+def text_to_audio(voice_name: str, ssml: str,video_file):
+
+    """Setting the configuration for tts API"""
+
     language_code = "-".join(voice_name.split("-")[:2])
-    text_input = tts.SynthesisInput(ssml=text)
+    text_input = tts.SynthesisInput(ssml=ssml)
     voice_params = tts.VoiceSelectionParams(
         language_code=language_code, name=voice_name, ssml_gender=tts.SsmlVoiceGender.NEUTRAL
     )
-    audio_config = tts.AudioConfig(audio_encoding=tts.AudioEncoding.LINEAR16, speaking_rate=0.8)
+    audio_config = tts.AudioConfig(audio_encoding=tts.AudioEncoding.LINEAR16, speaking_rate=0.9)
 
     client = tts.TextToSpeechClient()
     response = client.synthesize_speech(
         input=text_input, voice=voice_params, audio_config=audio_config
     )
+
+    """Stitching the generated audio on the video"""
 
     filename = f"{language_code}.wav"
     with open(filename, "wb") as out:
@@ -159,6 +187,6 @@ def text_to_audio(voice_name: str, text: str,video_file):
 
 def dub_video(filename,original_language,target_langauge):
     os.environ['GOOGLE_APPLICATION_CREDENTIALS'] = 'google_secret_key.json'
-    video_download_from_link(filename)
+    extract_audio(filename)
     return text_to_audio(target_langauge, audio_to_text("motiv.wav",original_language,target_langauge),filename)
 
